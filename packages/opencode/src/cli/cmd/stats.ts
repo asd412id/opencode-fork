@@ -3,7 +3,7 @@ import { cmd } from "./cmd"
 import { Session } from "../../session"
 import { bootstrap } from "../bootstrap"
 import { Database } from "../../storage/db"
-import { SessionTable } from "../../session/session.sql"
+import type { SessionRow } from "../../session/session.sql"
 import { Project } from "../../project/project"
 import { Instance } from "../../project/instance"
 
@@ -88,7 +88,7 @@ async function getCurrentProject(): Promise<Project.Info> {
 }
 
 async function getAllSessions(): Promise<Session.Info[]> {
-  const rows = Database.use((db) => db.select().from(SessionTable).all())
+  const rows = Database.use((db) => db.query<SessionRow, []>("SELECT * FROM session").all())
   return rows.map((row) => Session.fromRow(row))
 }
 
@@ -378,33 +378,15 @@ export function displayStats(stats: SessionStats, toolLimit?: number, modelLimit
     console.log("┌────────────────────────────────────────────────────────┐")
     console.log("│                      TOOL USAGE                        │")
     console.log("├────────────────────────────────────────────────────────┤")
-
-    const maxCount = Math.max(...toolsToDisplay.map(([, count]) => count))
-    const totalToolUsage = Object.values(stats.toolUsage).reduce((a, b) => a + b, 0)
-
     for (const [tool, count] of toolsToDisplay) {
-      const barLength = Math.max(1, Math.floor((count / maxCount) * 20))
-      const bar = "█".repeat(barLength)
-      const percentage = ((count / totalToolUsage) * 100).toFixed(1)
-
-      const maxToolLength = 18
-      const truncatedTool = tool.length > maxToolLength ? tool.substring(0, maxToolLength - 2) + ".." : tool
-      const toolName = truncatedTool.padEnd(maxToolLength)
-
-      const content = ` ${toolName} ${bar.padEnd(20)} ${count.toString().padStart(3)} (${percentage.padStart(4)}%)`
-      const padding = Math.max(0, width - content.length - 1)
-      console.log(`│${content}${" ".repeat(padding)} │`)
+      console.log(renderRow(tool, count.toLocaleString()))
     }
     console.log("└────────────────────────────────────────────────────────┘")
   }
-  console.log()
 }
 
-function formatNumber(num: number): string {
-  if (num >= 1000000) {
-    return (num / 1000000).toFixed(1) + "M"
-  } else if (num >= 1000) {
-    return (num / 1000).toFixed(1) + "K"
-  }
-  return num.toString()
+function formatNumber(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return n.toLocaleString()
 }

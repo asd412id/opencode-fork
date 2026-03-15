@@ -13,6 +13,7 @@ import { fn } from "@/util/fn"
 import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
+import { GC } from "@/util/gc"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelID, ProviderID } from "@/provider/schema"
 
@@ -92,11 +93,16 @@ export namespace SessionCompaction {
       for (const part of toPrune) {
         if (part.state.status === "completed") {
           part.state.time.compacted = Date.now()
+          const output = part.state.output
+          if (typeof output === "string" && output.length > 500) {
+            part.state.output = output.slice(0, 200) + "\n...[truncated]..."
+          }
           await Session.updatePart(part)
         }
       }
       log.info("pruned", { count: toPrune.length })
     }
+    GC.hint()
   }
 
   export async function process(input: {

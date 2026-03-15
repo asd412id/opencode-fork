@@ -1,8 +1,4 @@
 import { Database as BunDatabase } from "bun:sqlite"
-import { drizzle, type SQLiteBunDatabase } from "drizzle-orm/bun-sqlite"
-import { migrate } from "drizzle-orm/bun-sqlite/migrator"
-import { type SQLiteTransaction } from "drizzle-orm/sqlite-core"
-export * from "drizzle-orm"
 import { Context } from "../util/context"
 import { lazy } from "../util/lazy"
 import { Global } from "../global"
@@ -10,8 +6,7 @@ import { Log } from "../util/log"
 import { NamedError } from "@opencode-ai/util/error"
 import z from "zod"
 import path from "path"
-import { readFileSync, readdirSync, existsSync } from "fs"
-import * as schema from "./schema"
+import { readFileSync, readdirSync, existsSync, statSync } from "fs"
 import { Installation } from "../installation"
 import { Flag } from "../flag/flag"
 import { iife } from "@/util/iife"
@@ -35,11 +30,6 @@ export namespace Database {
     const safe = channel.replace(/[^a-zA-Z0-9._-]/g, "-")
     return path.join(Global.Path.data, `opencode-${safe}.db`)
   })
-
-  type Schema = typeof schema
-  export type Transaction = SQLiteTransaction<"sync", void, Schema>
-
-  type Client = SQLiteBunDatabase
 
   type Journal = { sql: string; timestamp: number; name: string }[]
 
@@ -80,22 +70,46 @@ export namespace Database {
     return sql.sort((a, b) => a.timestamp - b.timestamp)
   }
 
+  function migrate(db: BunDatabase, entries: Journal) {
+    db.run(`CREATE TABLE IF NOT EXISTS "__drizzle_migrations" (
+      id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+      hash text NOT NULL,
+      created_at numeric
+    )`)
+    const applied = new Set(
+      db
+        .query<{ hash: string }, []>("SELECT hash FROM __drizzle_migrations")
+        .all()
+        .map((r) => r.hash),
+    )
+    for (const entry of entries) {
+      const hash = entry.name
+      if (applied.has(hash)) continue
+      db.run("BEGIN")
+      try {
+        db.run(entry.sql)
+        db.query("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)").run(hash, entry.timestamp)
+        db.run("COMMIT")
+      } catch (err) {
+        db.run("ROLLBACK")
+        throw err
+      }
+    }
+  }
+
   export const Client = lazy(() => {
     log.info("opening database", { path: Path })
 
-    const sqlite = new BunDatabase(Path, { create: true })
-    state.sqlite = sqlite
+    const db = new BunDatabase(Path, { create: true })
+    state.sqlite = db
 
-    sqlite.run("PRAGMA journal_mode = WAL")
-    sqlite.run("PRAGMA synchronous = NORMAL")
-    sqlite.run("PRAGMA busy_timeout = 5000")
-    sqlite.run("PRAGMA cache_size = -64000")
-    sqlite.run("PRAGMA foreign_keys = ON")
-    sqlite.run("PRAGMA wal_checkpoint(PASSIVE)")
+    db.run("PRAGMA journal_mode = WAL")
+    db.run("PRAGMA synchronous = NORMAL")
+    db.run("PRAGMA busy_timeout = 5000")
+    db.run("PRAGMA cache_size = -64000")
+    db.run("PRAGMA foreign_keys = ON")
+    db.run("PRAGMA wal_checkpoint(PASSIVE)")
 
-    const db = drizzle({ client: sqlite })
-
-    // Apply schema migrations
     const entries =
       typeof OPENCODE_MIGRATIONS !== "undefined"
         ? OPENCODE_MIGRATIONS
@@ -117,27 +131,30 @@ export namespace Database {
   })
 
   export function close() {
-    const sqlite = state.sqlite
-    if (!sqlite) return
-    sqlite.close()
+    const db = state.sqlite
+    if (!db) return
+    db.close()
     state.sqlite = undefined
     Client.reset()
   }
 
-  export type TxOrDb = SQLiteTransaction<"sync", void, any, any> | Client
+  export function sqlite() {
+    Client()
+    return state.sqlite!
+  }
 
   const ctx = Context.create<{
-    tx: TxOrDb
+    db: BunDatabase
     effects: (() => void | Promise<void>)[]
   }>("database")
 
-  export function use<T>(callback: (trx: TxOrDb) => T): T {
+  export function use<T>(callback: (db: BunDatabase) => T): T {
     try {
-      return callback(ctx.use().tx)
+      return callback(ctx.use().db)
     } catch (err) {
       if (err instanceof Context.NotFound) {
         const effects: (() => void | Promise<void>)[] = []
-        const result = ctx.provide({ effects, tx: Client() }, () => callback(Client()))
+        const result = ctx.provide({ effects, db: Client() }, () => callback(Client()))
         for (const effect of effects) effect()
         return result
       }
@@ -153,19 +170,60 @@ export namespace Database {
     }
   }
 
-  export function transaction<T>(callback: (tx: TxOrDb) => T): T {
+  export function transaction<T>(callback: (db: BunDatabase) => T): T {
     try {
-      return callback(ctx.use().tx)
+      return callback(ctx.use().db)
     } catch (err) {
       if (err instanceof Context.NotFound) {
         const effects: (() => void | Promise<void>)[] = []
-        const result = (Client().transaction as any)((tx: TxOrDb) => {
-          return ctx.provide({ tx, effects }, () => callback(tx))
+        const db = Client()
+        const run = db.transaction(() => {
+          return ctx.provide({ db, effects }, () => callback(db))
         })
+        const result = run()
         for (const effect of effects) effect()
         return result
       }
       throw err
     }
+  }
+
+  export function size(): number {
+    try {
+      return statSync(Path).size
+    } catch {
+      return 0
+    }
+  }
+
+  export function checkpoint() {
+    try {
+      Client()
+      if (!state.sqlite) return
+      state.sqlite.run("PRAGMA wal_checkpoint(PASSIVE)")
+    } catch (e) {
+      log.warn("checkpoint failed", { error: String(e) })
+    }
+  }
+
+  export function vacuum() {
+    try {
+      const before = size()
+      Client()
+      if (!state.sqlite) return
+      state.sqlite.run("VACUUM")
+      const after = size()
+      log.info("vacuum done", {
+        before: mb(before),
+        after: mb(after),
+        saved: mb(before - after),
+      })
+    } catch (e) {
+      log.warn("vacuum failed", { error: String(e) })
+    }
+  }
+
+  function mb(bytes: number) {
+    return `${(bytes / 1024 / 1024).toFixed(1)}MB`
   }
 }

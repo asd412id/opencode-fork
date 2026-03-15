@@ -1,9 +1,8 @@
 import z from "zod"
 import { Filesystem } from "../util/filesystem"
 import path from "path"
-import { and, Database, eq } from "../storage/db"
-import { ProjectTable } from "./project.sql"
-import { SessionTable } from "../session/session.sql"
+import { Database } from "../storage/db"
+import type { ProjectRow } from "./project.sql"
 import { Log } from "../util/log"
 import { Flag } from "@/flag/flag"
 import { fn } from "@opencode-ai/util/fn"
@@ -65,26 +64,35 @@ export namespace Project {
     Updated: BusEvent.define("project.updated", Info),
   }
 
-  type Row = typeof ProjectTable.$inferSelect
+  type Row = ProjectRow
+
+  function parse(row: Row): Row {
+    return {
+      ...row,
+      sandboxes: typeof row.sandboxes === "string" ? JSON.parse(row.sandboxes) : row.sandboxes,
+      commands: typeof row.commands === "string" ? JSON.parse(row.commands) : row.commands,
+    }
+  }
 
   export function fromRow(row: Row): Info {
+    const parsed = parse(row)
     const icon =
-      row.icon_url || row.icon_color
-        ? { url: row.icon_url ?? undefined, color: row.icon_color ?? undefined }
+      parsed.icon_url || parsed.icon_color
+        ? { url: parsed.icon_url ?? undefined, color: parsed.icon_color ?? undefined }
         : undefined
     return {
-      id: ProjectID.make(row.id),
-      worktree: row.worktree,
-      vcs: row.vcs ? Info.shape.vcs.parse(row.vcs) : undefined,
-      name: row.name ?? undefined,
+      id: ProjectID.make(parsed.id),
+      worktree: parsed.worktree,
+      vcs: parsed.vcs ? Info.shape.vcs.parse(parsed.vcs) : undefined,
+      name: parsed.name ?? undefined,
       icon,
       time: {
-        created: row.time_created,
-        updated: row.time_updated,
-        initialized: row.time_initialized ?? undefined,
+        created: parsed.time_created,
+        updated: parsed.time_updated,
+        initialized: parsed.time_initialized ?? undefined,
       },
-      sandboxes: row.sandboxes,
-      commands: row.commands ?? undefined,
+      sandboxes: parsed.sandboxes,
+      commands: parsed.commands ?? undefined,
     }
   }
 
@@ -217,7 +225,7 @@ export namespace Project {
       }
     })
 
-    const row = Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, data.id)).get())
+    const row = Database.use((db) => db.query<ProjectRow, [string]>("SELECT * FROM project WHERE id = ?").get(data.id))
     const existing = row
       ? fromRow(row)
       : {
@@ -245,32 +253,36 @@ export namespace Project {
     if (data.sandbox !== result.worktree && !result.sandboxes.includes(data.sandbox))
       result.sandboxes.push(data.sandbox)
     result.sandboxes = result.sandboxes.filter((x) => existsSync(x))
-    const insert = {
-      id: result.id,
-      worktree: result.worktree,
-      vcs: result.vcs ?? null,
-      name: result.name,
-      icon_url: result.icon?.url,
-      icon_color: result.icon?.color,
-      time_created: result.time.created,
-      time_updated: result.time.updated,
-      time_initialized: result.time.initialized,
-      sandboxes: result.sandboxes,
-      commands: result.commands,
-    }
-    const updateSet = {
-      worktree: result.worktree,
-      vcs: result.vcs ?? null,
-      name: result.name,
-      icon_url: result.icon?.url,
-      icon_color: result.icon?.color,
-      time_updated: result.time.updated,
-      time_initialized: result.time.initialized,
-      sandboxes: result.sandboxes,
-      commands: result.commands,
-    }
+    const now = Date.now()
     Database.use((db) =>
-      db.insert(ProjectTable).values(insert).onConflictDoUpdate({ target: ProjectTable.id, set: updateSet }).run(),
+      db
+        .query(
+          `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             worktree = excluded.worktree,
+             vcs = excluded.vcs,
+             name = excluded.name,
+             icon_url = excluded.icon_url,
+             icon_color = excluded.icon_color,
+             time_updated = excluded.time_updated,
+             time_initialized = excluded.time_initialized,
+             sandboxes = excluded.sandboxes,
+             commands = excluded.commands`,
+        )
+        .run(
+          result.id,
+          result.worktree,
+          result.vcs ?? null,
+          result.name ?? null,
+          result.icon?.url ?? null,
+          result.icon?.color ?? null,
+          result.time.created,
+          now,
+          result.time.initialized ?? null,
+          JSON.stringify(result.sandboxes),
+          result.commands ? JSON.stringify(result.commands) : null,
+        ),
     )
     // Runs after upsert so the target project row exists (FK constraint).
     // Runs on every startup because sessions created before git init
@@ -278,10 +290,8 @@ export namespace Project {
     if (data.id !== ProjectID.global) {
       Database.use((db) =>
         db
-          .update(SessionTable)
-          .set({ project_id: data.id })
-          .where(and(eq(SessionTable.project_id, ProjectID.global), eq(SessionTable.directory, data.worktree)))
-          .run(),
+          .query("UPDATE session SET project_id = ? WHERE project_id = ? AND directory = ?")
+          .run(data.id, ProjectID.global, data.worktree),
       )
     }
     GlobalBus.emit("event", {
@@ -318,29 +328,20 @@ export namespace Project {
   }
 
   export function setInitialized(id: ProjectID) {
-    Database.use((db) =>
-      db
-        .update(ProjectTable)
-        .set({
-          time_initialized: Date.now(),
-        })
-        .where(eq(ProjectTable.id, id))
-        .run(),
-    )
+    Database.use((db) => db.query("UPDATE project SET time_initialized = ? WHERE id = ?").run(Date.now(), id))
   }
 
   export function list() {
     return Database.use((db) =>
       db
-        .select()
-        .from(ProjectTable)
+        .query<ProjectRow, []>("SELECT * FROM project")
         .all()
         .map((row) => fromRow(row)),
     )
   }
 
   export function get(id: ProjectID): Info | undefined {
-    const row = Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
+    const row = Database.use((db) => db.query<ProjectRow, [string]>("SELECT * FROM project WHERE id = ?").get(id))
     if (!row) return undefined
     return fromRow(row)
   }
@@ -369,19 +370,27 @@ export namespace Project {
     }),
     async (input) => {
       const id = ProjectID.make(input.projectID)
+      const sets: string[] = ["time_updated = ?"]
+      const vals: any[] = [Date.now()]
+      if (input.name !== undefined) {
+        sets.push("name = ?")
+        vals.push(input.name)
+      }
+      if (input.icon?.url !== undefined) {
+        sets.push("icon_url = ?")
+        vals.push(input.icon.url)
+      }
+      if (input.icon?.color !== undefined) {
+        sets.push("icon_color = ?")
+        vals.push(input.icon.color)
+      }
+      if (input.commands !== undefined) {
+        sets.push("commands = ?")
+        vals.push(input.commands ? JSON.stringify(input.commands) : null)
+      }
+      vals.push(id)
       const result = Database.use((db) =>
-        db
-          .update(ProjectTable)
-          .set({
-            name: input.name,
-            icon_url: input.icon?.url,
-            icon_color: input.icon?.color,
-            commands: input.commands,
-            time_updated: Date.now(),
-          })
-          .where(eq(ProjectTable.id, id))
-          .returning()
-          .get(),
+        db.query<ProjectRow, any[]>(`UPDATE project SET ${sets.join(", ")} WHERE id = ? RETURNING *`).get(...vals),
       )
       if (!result) throw new Error(`Project not found: ${input.projectID}`)
       const data = fromRow(result)
@@ -396,7 +405,7 @@ export namespace Project {
   )
 
   export async function sandboxes(id: ProjectID) {
-    const row = Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
+    const row = Database.use((db) => db.query<ProjectRow, [string]>("SELECT * FROM project WHERE id = ?").get(id))
     if (!row) return []
     const data = fromRow(row)
     const valid: string[] = []
@@ -408,17 +417,18 @@ export namespace Project {
   }
 
   export async function addSandbox(id: ProjectID, directory: string) {
-    const row = Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
+    const row = Database.use((db) => db.query<ProjectRow, [string]>("SELECT * FROM project WHERE id = ?").get(id))
     if (!row) throw new Error(`Project not found: ${id}`)
-    const sandboxes = [...row.sandboxes]
-    if (!sandboxes.includes(directory)) sandboxes.push(directory)
+    const parsed = parse(row)
+    const sbx = [...parsed.sandboxes]
+    if (!sbx.includes(directory)) sbx.push(directory)
     const result = Database.use((db) =>
       db
-        .update(ProjectTable)
-        .set({ sandboxes, time_updated: Date.now() })
-        .where(eq(ProjectTable.id, id))
-        .returning()
-        .get(),
+        .query<
+          ProjectRow,
+          [string, number, string]
+        >("UPDATE project SET sandboxes = ?, time_updated = ? WHERE id = ? RETURNING *")
+        .get(JSON.stringify(sbx), Date.now(), id),
     )
     if (!result) throw new Error(`Project not found: ${id}`)
     const data = fromRow(result)
@@ -432,16 +442,17 @@ export namespace Project {
   }
 
   export async function removeSandbox(id: ProjectID, directory: string) {
-    const row = Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
+    const row = Database.use((db) => db.query<ProjectRow, [string]>("SELECT * FROM project WHERE id = ?").get(id))
     if (!row) throw new Error(`Project not found: ${id}`)
-    const sandboxes = row.sandboxes.filter((s) => s !== directory)
+    const parsed = parse(row)
+    const sbx = parsed.sandboxes.filter((s) => s !== directory)
     const result = Database.use((db) =>
       db
-        .update(ProjectTable)
-        .set({ sandboxes, time_updated: Date.now() })
-        .where(eq(ProjectTable.id, id))
-        .returning()
-        .get(),
+        .query<
+          ProjectRow,
+          [string, number, string]
+        >("UPDATE project SET sandboxes = ?, time_updated = ? WHERE id = ? RETURNING *")
+        .get(JSON.stringify(sbx), Date.now(), id),
     )
     if (!result) throw new Error(`Project not found: ${id}`)
     const data = fromRow(result)

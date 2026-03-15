@@ -3,8 +3,8 @@ import { BusEvent } from "@/bus/bus-event"
 import { Instance } from "@/project/instance"
 import { ProjectID } from "@/project/schema"
 import { MessageID, SessionID } from "@/session/schema"
-import { PermissionTable } from "@/session/session.sql"
-import { Database, eq } from "@/storage/db"
+import type { PermissionRow } from "@/session/session.sql"
+import { Database } from "@/storage/db"
 import { InstanceState } from "@/util/instance-state"
 import { Log } from "@/util/log"
 import { Wildcard } from "@/util/wildcard"
@@ -136,11 +136,11 @@ export class PermissionService extends ServiceMap.Service<PermissionService, Per
       const instanceState = yield* InstanceState.make<State>(() =>
         Effect.sync(() => {
           const row = Database.use((db) =>
-            db.select().from(PermissionTable).where(eq(PermissionTable.project_id, Instance.project.id)).get(),
+            db.query<PermissionRow, [string]>("SELECT * FROM permission WHERE project_id = ?").get(Instance.project.id),
           )
           return {
             pending: new Map<PermissionID, PendingEntry>(),
-            approved: row?.data ?? [],
+            approved: row ? (typeof row.data === "string" ? JSON.parse(row.data as string) : row.data) : [],
           }
         }),
       )
@@ -241,8 +241,6 @@ export class PermissionService extends ServiceMap.Service<PermissionService, Per
 
         // TODO: we don't save the permission ruleset to disk yet until there's
         // UI to manage it
-        // db().insert(PermissionTable).values({ projectID: Instance.project.id, data: s.approved })
-        //   .onConflictDoUpdate({ target: PermissionTable.projectID, set: { data: s.approved } }).run()
       })
 
       const list = Effect.fn("PermissionService.list")(function* () {

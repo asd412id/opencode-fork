@@ -6,8 +6,8 @@ import { Global } from "../global"
 import { Instance } from "../project/instance"
 import { InstanceBootstrap } from "../project/bootstrap"
 import { Project } from "../project/project"
-import { Database, eq } from "../storage/db"
-import { ProjectTable } from "../project/project.sql"
+import { Database } from "../storage/db"
+import type { ProjectRow } from "../project/project.sql"
 import type { ProjectID } from "../project/schema"
 import { fn } from "../util/fn"
 import { Log } from "../util/log"
@@ -312,7 +312,20 @@ export namespace Worktree {
   }
 
   async function runStartScripts(directory: string, input: { projectID: ProjectID; extra?: string }) {
-    const row = Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, input.projectID)).get())
+    const raw = Database.use((db) =>
+      db.query<ProjectRow, [string]>("SELECT * FROM project WHERE id = ?").get(input.projectID),
+    )
+    const row = raw
+      ? {
+          ...raw,
+          sandboxes: typeof raw.sandboxes === "string" ? JSON.parse(raw.sandboxes as string) : raw.sandboxes,
+          commands: raw.commands
+            ? typeof raw.commands === "string"
+              ? JSON.parse(raw.commands as string)
+              : raw.commands
+            : null,
+        }
+      : undefined
     const project = row ? Project.fromRow(row) : undefined
     const startup = project?.commands?.start?.trim() ?? ""
     const ok = await runStartScript(directory, startup, "project")

@@ -6,11 +6,10 @@ import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessag
 import { LSP } from "../lsp"
 import { Snapshot } from "@/snapshot"
 import { fn } from "@/util/fn"
-import { Database, NotFoundError, and, desc, eq, inArray, lt, or } from "@/storage/db"
-import { MessageTable, PartTable, SessionTable } from "./session.sql"
+import { Database, NotFoundError } from "@/storage/db"
+import type { MessageRow, PartRow } from "./session.sql"
 import { ProviderTransform } from "@/provider/transform"
 import { STATUS_CODES } from "http"
-import { Storage } from "@/storage/storage"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { type SystemError } from "bun"
@@ -509,38 +508,30 @@ export namespace MessageV2 {
     },
   }
 
-  const info = (row: typeof MessageTable.$inferSelect) =>
+  const info = (row: MessageRow) =>
     ({
-      ...row.data,
+      ...(typeof row.data === "string" ? JSON.parse(row.data) : row.data),
       id: row.id,
       sessionID: row.session_id,
     }) as MessageV2.Info
 
-  const part = (row: typeof PartTable.$inferSelect) =>
+  const part = (row: PartRow) =>
     ({
-      ...row.data,
+      ...(typeof row.data === "string" ? JSON.parse(row.data) : row.data),
       id: row.id,
       sessionID: row.session_id,
       messageID: row.message_id,
     }) as MessageV2.Part
 
-  const older = (row: Cursor) =>
-    or(
-      lt(MessageTable.time_created, row.time),
-      and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)),
-    )
-
-  async function hydrate(rows: (typeof MessageTable.$inferSelect)[]) {
+  async function hydrate(rows: MessageRow[]) {
     const ids = rows.map((row) => row.id)
     const partByMessage = new Map<string, MessageV2.Part[]>()
     if (ids.length > 0) {
+      const placeholders = ids.map(() => "?").join(",")
       const partRows = Database.use((db) =>
         db
-          .select()
-          .from(PartTable)
-          .where(inArray(PartTable.message_id, ids))
-          .orderBy(PartTable.message_id, PartTable.id)
-          .all(),
+          .query<PartRow, string[]>(`SELECT * FROM part WHERE message_id IN (${placeholders}) ORDER BY message_id, id`)
+          .all(...ids),
       )
       for (const row of partRows) {
         const next = part(row)
@@ -799,21 +790,25 @@ export namespace MessageV2 {
     }),
     async (input) => {
       const before = input.before ? cursor.decode(input.before) : undefined
-      const where = before
-        ? and(eq(MessageTable.session_id, input.sessionID), older(before))
-        : eq(MessageTable.session_id, input.sessionID)
-      const rows = Database.use((db) =>
-        db
-          .select()
-          .from(MessageTable)
-          .where(where)
-          .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
-          .limit(input.limit + 1)
-          .all(),
-      )
+      const rows = Database.use((db) => {
+        if (before) {
+          return db
+            .query<
+              MessageRow,
+              [string, number, number, string, number]
+            >(`SELECT * FROM message WHERE session_id = ? AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?`)
+            .all(input.sessionID, before.time, before.time, before.id, input.limit + 1)
+        }
+        return db
+          .query<
+            MessageRow,
+            [string, number]
+          >(`SELECT * FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC LIMIT ?`)
+          .all(input.sessionID, input.limit + 1)
+      })
       if (rows.length === 0) {
         const row = Database.use((db) =>
-          db.select({ id: SessionTable.id }).from(SessionTable).where(eq(SessionTable.id, input.sessionID)).get(),
+          db.query<{ id: string }, [string]>(`SELECT id FROM session WHERE id = ?`).get(input.sessionID),
         )
         if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
         return {
@@ -851,11 +846,9 @@ export namespace MessageV2 {
 
   export const parts = fn(MessageID.zod, async (message_id) => {
     const rows = Database.use((db) =>
-      db.select().from(PartTable).where(eq(PartTable.message_id, message_id)).orderBy(PartTable.id).all(),
+      db.query<PartRow, [string]>(`SELECT * FROM part WHERE message_id = ? ORDER BY id`).all(message_id),
     )
-    return rows.map(
-      (row) => ({ ...row.data, id: row.id, sessionID: row.session_id, messageID: row.message_id }) as MessageV2.Part,
-    )
+    return rows.map((row) => part(row))
   })
 
   export const get = fn(
@@ -866,10 +859,8 @@ export namespace MessageV2 {
     async (input): Promise<WithParts> => {
       const row = Database.use((db) =>
         db
-          .select()
-          .from(MessageTable)
-          .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
-          .get(),
+          .query<MessageRow, [string, string]>(`SELECT * FROM message WHERE id = ? AND session_id = ?`)
+          .get(input.messageID, input.sessionID),
       )
       if (!row) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
       return {
@@ -895,6 +886,49 @@ export namespace MessageV2 {
     }
     result.reverse()
     return result
+  }
+
+  export async function since(sessionID: SessionID) {
+    const db = Database.sqlite()
+    const boundary = db
+      .query<{ time: number }, [string]>(
+        `SELECT m.time_created as time
+         FROM message m
+         WHERE m.session_id = ?
+           AND json_extract(m.data, '$.role') = 'user'
+           AND EXISTS (
+             SELECT 1 FROM part p
+             WHERE p.message_id = m.id
+               AND json_extract(p.data, '$.type') = 'compaction'
+           )
+           AND EXISTS (
+             SELECT 1 FROM message a
+             WHERE a.session_id = m.session_id
+               AND json_extract(a.data, '$.role') = 'assistant'
+               AND json_extract(a.data, '$.summary') = 1
+               AND json_extract(a.data, '$.finish') IS NOT NULL
+               AND json_extract(a.data, '$.error') IS NULL
+               AND json_extract(a.data, '$.parentID') = m.id
+           )
+         ORDER BY m.time_created DESC
+         LIMIT 1`,
+      )
+      .get(sessionID)
+
+    const rows = Database.use((db) => {
+      if (boundary) {
+        return db
+          .query<
+            MessageRow,
+            [string, number]
+          >(`SELECT * FROM message WHERE session_id = ? AND time_created >= ? ORDER BY time_created`)
+          .all(sessionID, boundary.time)
+      }
+      return db
+        .query<MessageRow, [string]>(`SELECT * FROM message WHERE session_id = ? ORDER BY time_created`)
+        .all(sessionID)
+    })
+    return hydrate(rows)
   }
 
   export function fromError(e: unknown, ctx: { providerID: ProviderID }): NonNullable<Assistant["error"]> {

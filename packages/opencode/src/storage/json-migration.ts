@@ -1,10 +1,6 @@
 import { Database } from "bun:sqlite"
-import { drizzle } from "drizzle-orm/bun-sqlite"
 import { Global } from "../global"
 import { Log } from "../util/log"
-import { ProjectTable } from "../project/project.sql"
-import { SessionTable, MessageTable, PartTable, TodoTable, PermissionTable } from "../session/session.sql"
-import { SessionShareTable } from "../share/share.sql"
 import path from "path"
 import { existsSync } from "fs"
 import { Filesystem } from "../util/filesystem"
@@ -42,8 +38,6 @@ export namespace JsonMigration {
 
     log.info("starting json to sqlite migration", { storageDir })
     const start = performance.now()
-
-    const db = drizzle({ client: sqlite })
 
     // Optimize SQLite for bulk inserts
     sqlite.exec("PRAGMA journal_mode = WAL")
@@ -94,17 +88,6 @@ export namespace JsonMigration {
       return items
     }
 
-    function insert(values: any[], table: any, label: string) {
-      if (values.length === 0) return 0
-      try {
-        db.insert(table).values(values).onConflictDoNothing().run()
-        return values.length
-      } catch (e) {
-        errs.push(`failed to migrate ${label} batch: ${e}`)
-        return 0
-      }
-    }
-
     // Pre-scan all files upfront to avoid repeated glob operations
     log.info("scanning files...")
     const [projectFiles, sessionFiles, messageFiles, partFiles, todoFiles, permFiles, shareFiles] = await Promise.all([
@@ -148,34 +131,57 @@ export namespace JsonMigration {
 
     sqlite.exec("BEGIN TRANSACTION")
 
+    // Prepared statements for batch inserts
+    const stmts = {
+      project: sqlite.query(
+        `INSERT OR IGNORE INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      session: sqlite.query(
+        `INSERT OR IGNORE INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      message: sqlite.query(
+        `INSERT OR IGNORE INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)`,
+      ),
+      part: sqlite.query(
+        `INSERT OR IGNORE INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)`,
+      ),
+      todo: sqlite.query(
+        `INSERT OR IGNORE INTO todo (session_id, content, status, priority, position, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      permission: sqlite.query(`INSERT OR IGNORE INTO permission (project_id, data) VALUES (?, ?)`),
+      share: sqlite.query(`INSERT OR IGNORE INTO session_share (session_id, id, secret, url) VALUES (?, ?, ?, ?)`),
+    }
+
     // Migrate projects first (no FK deps)
     // Derive all IDs from file paths, not JSON content
     const projectIds = new Set<string>()
-    const projectValues = [] as any[]
     for (let i = 0; i < projectFiles.length; i += batchSize) {
       const end = Math.min(i + batchSize, projectFiles.length)
       const batch = await read(projectFiles, i, end)
-      projectValues.length = 0
       for (let j = 0; j < batch.length; j++) {
         const data = batch[j]
         if (!data) continue
         const id = path.basename(projectFiles[i + j], ".json")
         projectIds.add(id)
-        projectValues.push({
-          id,
-          worktree: data.worktree ?? "/",
-          vcs: data.vcs,
-          name: data.name ?? undefined,
-          icon_url: data.icon?.url,
-          icon_color: data.icon?.color,
-          time_created: data.time?.created ?? now,
-          time_updated: data.time?.updated ?? now,
-          time_initialized: data.time?.initialized,
-          sandboxes: data.sandboxes ?? [],
-          commands: data.commands,
-        })
+        try {
+          stmts.project.run(
+            id,
+            data.worktree ?? "/",
+            data.vcs,
+            data.name ?? null,
+            data.icon?.url ?? null,
+            data.icon?.color ?? null,
+            data.time?.created ?? now,
+            data.time?.updated ?? now,
+            data.time?.initialized ?? null,
+            JSON.stringify(data.sandboxes ?? []),
+            data.commands ? JSON.stringify(data.commands) : null,
+          )
+          stats.projects++
+        } catch (e) {
+          errs.push(`failed to migrate project ${id}: ${e}`)
+        }
       }
-      stats.projects += insert(projectValues, ProjectTable, "project")
       step("projects", end - i)
     }
     log.info("migrated projects", { count: stats.projects, duration: Math.round(performance.now() - start) })
@@ -185,11 +191,9 @@ export namespace JsonMigration {
     // migrations may have moved sessions to new directories without updating the JSON
     const sessionProjects = sessionFiles.map((file) => path.basename(path.dirname(file)))
     const sessionIds = new Set<string>()
-    const sessionValues = [] as any[]
     for (let i = 0; i < sessionFiles.length; i += batchSize) {
       const end = Math.min(i + batchSize, sessionFiles.length)
       const batch = await read(sessionFiles, i, end)
-      sessionValues.length = 0
       for (let j = 0; j < batch.length; j++) {
         const data = batch[j]
         if (!data) continue
@@ -200,28 +204,32 @@ export namespace JsonMigration {
           continue
         }
         sessionIds.add(id)
-        sessionValues.push({
-          id,
-          project_id: projectID,
-          parent_id: data.parentID ?? null,
-          slug: data.slug ?? "",
-          directory: data.directory ?? "",
-          title: data.title ?? "",
-          version: data.version ?? "",
-          share_url: data.share?.url ?? null,
-          summary_additions: data.summary?.additions ?? null,
-          summary_deletions: data.summary?.deletions ?? null,
-          summary_files: data.summary?.files ?? null,
-          summary_diffs: data.summary?.diffs ?? null,
-          revert: data.revert ?? null,
-          permission: data.permission ?? null,
-          time_created: data.time?.created ?? now,
-          time_updated: data.time?.updated ?? now,
-          time_compacting: data.time?.compacting ?? null,
-          time_archived: data.time?.archived ?? null,
-        })
+        try {
+          stmts.session.run(
+            id,
+            projectID,
+            data.parentID ?? null,
+            data.slug ?? "",
+            data.directory ?? "",
+            data.title ?? "",
+            data.version ?? "",
+            data.share?.url ?? null,
+            data.summary?.additions ?? null,
+            data.summary?.deletions ?? null,
+            data.summary?.files ?? null,
+            data.summary?.diffs ? JSON.stringify(data.summary.diffs) : null,
+            data.revert ? JSON.stringify(data.revert) : null,
+            data.permission ? JSON.stringify(data.permission) : null,
+            data.time?.created ?? now,
+            data.time?.updated ?? now,
+            data.time?.compacting ?? null,
+            data.time?.archived ?? null,
+          )
+          stats.sessions++
+        } catch (e) {
+          errs.push(`failed to migrate session ${id}: ${e}`)
+        }
       }
-      stats.sessions += insert(sessionValues, SessionTable, "session")
       step("sessions", end - i)
     }
     log.info("migrated sessions", { count: stats.sessions })
@@ -243,8 +251,6 @@ export namespace JsonMigration {
     for (let i = 0; i < allMessageFiles.length; i += batchSize) {
       const end = Math.min(i + batchSize, allMessageFiles.length)
       const batch = await read(allMessageFiles, i, end)
-      const values = new Array(batch.length)
-      let count = 0
       for (let j = 0; j < batch.length; j++) {
         const data = batch[j]
         if (!data) continue
@@ -255,16 +261,13 @@ export namespace JsonMigration {
         const rest = data
         delete rest.id
         delete rest.sessionID
-        values[count++] = {
-          id,
-          session_id: sessionID,
-          time_created: data.time?.created ?? now,
-          time_updated: data.time?.updated ?? now,
-          data: rest,
+        try {
+          stmts.message.run(id, sessionID, data.time?.created ?? now, data.time?.updated ?? now, JSON.stringify(rest))
+          stats.messages++
+        } catch (e) {
+          errs.push(`failed to migrate message ${id}: ${e}`)
         }
       }
-      values.length = count
-      stats.messages += insert(values, MessageTable, "message")
       step("messages", end - i)
     }
     log.info("migrated messages", { count: stats.messages })
@@ -273,8 +276,6 @@ export namespace JsonMigration {
     for (let i = 0; i < partFiles.length; i += batchSize) {
       const end = Math.min(i + batchSize, partFiles.length)
       const batch = await read(partFiles, i, end)
-      const values = new Array(batch.length)
-      let count = 0
       for (let j = 0; j < batch.length; j++) {
         const data = batch[j]
         if (!data) continue
@@ -291,17 +292,20 @@ export namespace JsonMigration {
         delete rest.id
         delete rest.messageID
         delete rest.sessionID
-        values[count++] = {
-          id,
-          message_id: messageID,
-          session_id: sessionID,
-          time_created: data.time?.created ?? now,
-          time_updated: data.time?.updated ?? now,
-          data: rest,
+        try {
+          stmts.part.run(
+            id,
+            messageID,
+            sessionID,
+            data.time?.created ?? now,
+            data.time?.updated ?? now,
+            JSON.stringify(rest),
+          )
+          stats.parts++
+        } catch (e) {
+          errs.push(`failed to migrate part ${id}: ${e}`)
         }
       }
-      values.length = count
-      stats.parts += insert(values, PartTable, "part")
       step("parts", end - i)
     }
     log.info("migrated parts", { count: stats.parts })
@@ -311,7 +315,6 @@ export namespace JsonMigration {
     for (let i = 0; i < todoFiles.length; i += batchSize) {
       const end = Math.min(i + batchSize, todoFiles.length)
       const batch = await read(todoFiles, i, end)
-      const values = [] as any[]
       for (let j = 0; j < batch.length; j++) {
         const data = batch[j]
         if (!data) continue
@@ -327,18 +330,14 @@ export namespace JsonMigration {
         for (let position = 0; position < data.length; position++) {
           const todo = data[position]
           if (!todo?.content || !todo?.status || !todo?.priority) continue
-          values.push({
-            session_id: sessionID,
-            content: todo.content,
-            status: todo.status,
-            priority: todo.priority,
-            position,
-            time_created: now,
-            time_updated: now,
-          })
+          try {
+            stmts.todo.run(sessionID, todo.content, todo.status, todo.priority, position, now, now)
+            stats.todos++
+          } catch (e) {
+            errs.push(`failed to migrate todo for session ${sessionID}: ${e}`)
+          }
         }
       }
-      stats.todos += insert(values, TodoTable, "todo")
       step("todos", end - i)
     }
     log.info("migrated todos", { count: stats.todos })
@@ -348,11 +347,9 @@ export namespace JsonMigration {
 
     // Migrate permissions
     const permProjects = permFiles.map((file) => path.basename(file, ".json"))
-    const permValues = [] as any[]
     for (let i = 0; i < permFiles.length; i += batchSize) {
       const end = Math.min(i + batchSize, permFiles.length)
       const batch = await read(permFiles, i, end)
-      permValues.length = 0
       for (let j = 0; j < batch.length; j++) {
         const data = batch[j]
         if (!data) continue
@@ -361,9 +358,13 @@ export namespace JsonMigration {
           orphans.permissions++
           continue
         }
-        permValues.push({ project_id: projectID, data })
+        try {
+          stmts.permission.run(projectID, JSON.stringify(data))
+          stats.permissions++
+        } catch (e) {
+          errs.push(`failed to migrate permission for project ${projectID}: ${e}`)
+        }
       }
-      stats.permissions += insert(permValues, PermissionTable, "permission")
       step("permissions", end - i)
     }
     log.info("migrated permissions", { count: stats.permissions })
@@ -373,11 +374,9 @@ export namespace JsonMigration {
 
     // Migrate session shares
     const shareSessions = shareFiles.map((file) => path.basename(file, ".json"))
-    const shareValues = [] as any[]
     for (let i = 0; i < shareFiles.length; i += batchSize) {
       const end = Math.min(i + batchSize, shareFiles.length)
       const batch = await read(shareFiles, i, end)
-      shareValues.length = 0
       for (let j = 0; j < batch.length; j++) {
         const data = batch[j]
         if (!data) continue
@@ -390,9 +389,13 @@ export namespace JsonMigration {
           errs.push(`session_share missing id/secret/url: ${shareFiles[i + j]}`)
           continue
         }
-        shareValues.push({ session_id: sessionID, id: data.id, secret: data.secret, url: data.url })
+        try {
+          stmts.share.run(sessionID, data.id, data.secret, data.url)
+          stats.shares++
+        } catch (e) {
+          errs.push(`failed to migrate session_share for session ${sessionID}: ${e}`)
+        }
       }
-      stats.shares += insert(shareValues, SessionShareTable, "session_share")
       step("shares", end - i)
     }
     log.info("migrated session shares", { count: stats.shares })

@@ -95,6 +95,22 @@ assistant: [Uses the Task tool]
 
 IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the conversation.
 
+# Memory Management
+You have access to persistent memory tools that survive across sessions. Use them proactively:
+- **MemoryWrite**: Store important discoveries (architecture info, config paths, conventions, user preferences). Use keys like "arch.{component}", "pattern.{name}", "pref.{topic}".
+- **MemoryRead**: Retrieve previously stored context by key.
+- **MemorySearch**: Find stored memories by key pattern or tags when you don't know the exact key.
+- **MemoryList**: See all stored memory keys at a glance.
+- **MemoryDelete**: Remove outdated memories.
+- **ContextLog**: Log decisions, changes, todos, errors, and notes to the project tracker. Always log after making file changes or architectural decisions.
+- **ContextStatus**: View recent activity, pending todos, and decisions from the tracker.
+
+Use memory tools to:
+- Store architecture discoveries so you don't re-explore next session
+- Log every file change and decision for audit trail
+- Remember user preferences and project conventions
+- Track progress on multi-step tasks across sessions
+
 # Code References
 
 When referencing specific functions or pieces of code include the pattern `file_path:line_number` to allow the user to easily navigate to the source code location.

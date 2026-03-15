@@ -6,8 +6,8 @@ import { ProviderID, ModelID } from "@/provider/schema"
 import { Session } from "@/session"
 import type { SessionID } from "@/session/schema"
 import { MessageV2 } from "@/session/message-v2"
-import { Database, eq } from "@/storage/db"
-import { SessionShareTable } from "./share.sql"
+import { Database } from "@/storage/db"
+import type { SessionShareRow } from "./share.sql"
 import { Log } from "@/util/log"
 import type * as SDK from "@opencode-ai/sdk/v2"
 
@@ -127,16 +127,14 @@ export namespace ShareNext {
     }
 
     const result = (await response.json()) as { id: string; url: string; secret: string }
+    const now = Date.now()
 
     Database.use((db) =>
       db
-        .insert(SessionShareTable)
-        .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
-        .onConflictDoUpdate({
-          target: SessionShareTable.session_id,
-          set: { id: result.id, secret: result.secret, url: result.url },
-        })
-        .run(),
+        .query(
+          "INSERT INTO session_share (session_id, id, secret, url, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET id = ?, secret = ?, url = ?, time_updated = ?",
+        )
+        .run(sessionID, result.id, result.secret, result.url, now, now, result.id, result.secret, result.url, now),
     )
     fullSync(sessionID)
     return result
@@ -144,7 +142,7 @@ export namespace ShareNext {
 
   function get(sessionID: SessionID) {
     const row = Database.use((db) =>
-      db.select().from(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).get(),
+      db.query<SessionShareRow, [string]>("SELECT * FROM session_share WHERE session_id = ?").get(sessionID),
     )
     if (!row) return
     return { id: row.id, secret: row.secret, url: row.url }
@@ -247,7 +245,7 @@ export namespace ShareNext {
       throw new Error(`Failed to remove share (${response.status}): ${message || response.statusText}`)
     }
 
-    Database.use((db) => db.delete(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).run())
+    Database.use((db) => db.query("DELETE FROM session_share WHERE session_id = ?").run(sessionID))
   }
 
   async function fullSync(sessionID: SessionID) {

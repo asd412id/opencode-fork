@@ -1,12 +1,12 @@
 import z from "zod"
 import { fn } from "@/util/fn"
-import { Database, eq } from "@/storage/db"
+import { Database } from "@/storage/db"
 import { Project } from "@/project/project"
 import { BusEvent } from "@/bus/bus-event"
 import { GlobalBus } from "@/bus/global"
 import { Log } from "@/util/log"
 import { ProjectID } from "@/project/schema"
-import { WorkspaceTable } from "./workspace.sql"
+import type { WorkspaceRow } from "./workspace.sql"
 import { getAdaptor } from "./adaptors"
 import { WorkspaceInfo } from "./types"
 import { WorkspaceID } from "./schema"
@@ -33,14 +33,14 @@ export namespace Workspace {
   })
   export type Info = z.infer<typeof Info>
 
-  function fromRow(row: typeof WorkspaceTable.$inferSelect): Info {
+  function fromRow(row: WorkspaceRow): Info {
     return {
       id: row.id,
       type: row.type,
       branch: row.branch,
       name: row.name,
       directory: row.directory,
-      extra: row.extra,
+      extra: row.extra ? (typeof row.extra === "string" ? JSON.parse(row.extra as string) : row.extra) : null,
       projectID: row.project_id,
     }
   }
@@ -70,17 +70,17 @@ export namespace Workspace {
     }
 
     Database.use((db) => {
-      db.insert(WorkspaceTable)
-        .values({
-          id: info.id,
-          type: info.type,
-          branch: info.branch,
-          name: info.name,
-          directory: info.directory,
-          extra: info.extra,
-          project_id: info.projectID,
-        })
-        .run()
+      db.query(
+        "INSERT INTO workspace (id, type, branch, name, directory, extra, project_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        info.id,
+        info.type,
+        info.branch,
+        info.name,
+        info.directory,
+        info.extra ? JSON.stringify(info.extra) : null,
+        info.projectID,
+      )
     })
 
     await adaptor.create(config)
@@ -89,24 +89,24 @@ export namespace Workspace {
 
   export function list(project: Project.Info) {
     const rows = Database.use((db) =>
-      db.select().from(WorkspaceTable).where(eq(WorkspaceTable.project_id, project.id)).all(),
+      db.query<WorkspaceRow, [string]>("SELECT * FROM workspace WHERE project_id = ?").all(project.id),
     )
     return rows.map(fromRow).sort((a, b) => a.id.localeCompare(b.id))
   }
 
   export const get = fn(WorkspaceID.zod, async (id) => {
-    const row = Database.use((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get())
+    const row = Database.use((db) => db.query<WorkspaceRow, [string]>("SELECT * FROM workspace WHERE id = ?").get(id))
     if (!row) return
     return fromRow(row)
   })
 
   export const remove = fn(WorkspaceID.zod, async (id) => {
-    const row = Database.use((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get())
+    const row = Database.use((db) => db.query<WorkspaceRow, [string]>("SELECT * FROM workspace WHERE id = ?").get(id))
     if (row) {
       const info = fromRow(row)
       const adaptor = await getAdaptor(row.type)
       adaptor.remove(info)
-      Database.use((db) => db.delete(WorkspaceTable).where(eq(WorkspaceTable.id, id)).run())
+      Database.use((db) => db.query("DELETE FROM workspace WHERE id = ?").run(id))
       return info
     }
   })

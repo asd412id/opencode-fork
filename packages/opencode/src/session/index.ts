@@ -9,11 +9,9 @@ import { Config } from "../config/config"
 import { Flag } from "../flag/flag"
 import { Installation } from "../installation"
 
-import { Database, NotFoundError, eq, and, or, gte, isNull, desc, like, inArray, lt } from "../storage/db"
-import type { SQL } from "../storage/db"
-import { SessionTable, MessageTable, PartTable } from "./session.sql"
-import { ProjectTable } from "../project/project.sql"
-import { Storage } from "@/storage/storage"
+import { Database, NotFoundError } from "../storage/db"
+import type { SessionRow } from "./session.sql"
+import { SessionDiff } from "./session-diff.sql"
 import { Log } from "../util/log"
 import { MessageV2 } from "./message-v2"
 import { Instance } from "../project/instance"
@@ -49,38 +47,46 @@ export namespace Session {
     ).test(title)
   }
 
-  type SessionRow = typeof SessionTable.$inferSelect
+  function parseSession(row: SessionRow): SessionRow {
+    return {
+      ...row,
+      summary_diffs: row.summary_diffs ? JSON.parse(row.summary_diffs as any) : null,
+      revert: row.revert ? JSON.parse(row.revert as any) : null,
+      permission: row.permission ? JSON.parse(row.permission as any) : null,
+    }
+  }
 
   export function fromRow(row: SessionRow): Info {
+    const parsed = parseSession(row)
     const summary =
-      row.summary_additions !== null || row.summary_deletions !== null || row.summary_files !== null
+      parsed.summary_additions !== null || parsed.summary_deletions !== null || parsed.summary_files !== null
         ? {
-            additions: row.summary_additions ?? 0,
-            deletions: row.summary_deletions ?? 0,
-            files: row.summary_files ?? 0,
-            diffs: row.summary_diffs ?? undefined,
+            additions: parsed.summary_additions ?? 0,
+            deletions: parsed.summary_deletions ?? 0,
+            files: parsed.summary_files ?? 0,
+            diffs: parsed.summary_diffs ?? undefined,
           }
         : undefined
-    const share = row.share_url ? { url: row.share_url } : undefined
-    const revert = row.revert ?? undefined
+    const share = parsed.share_url ? { url: parsed.share_url } : undefined
+    const revert = parsed.revert ?? undefined
     return {
-      id: row.id,
-      slug: row.slug,
-      projectID: row.project_id,
-      workspaceID: row.workspace_id ?? undefined,
-      directory: row.directory,
-      parentID: row.parent_id ?? undefined,
-      title: row.title,
-      version: row.version,
+      id: parsed.id,
+      slug: parsed.slug,
+      projectID: parsed.project_id,
+      workspaceID: parsed.workspace_id ?? undefined,
+      directory: parsed.directory,
+      parentID: parsed.parent_id ?? undefined,
+      title: parsed.title,
+      version: parsed.version,
       summary,
       share,
       revert,
-      permission: row.permission ?? undefined,
+      permission: parsed.permission ?? undefined,
       time: {
-        created: row.time_created,
-        updated: row.time_updated,
-        compacting: row.time_compacting ?? undefined,
-        archived: row.time_archived ?? undefined,
+        created: parsed.time_created,
+        updated: parsed.time_updated,
+        compacting: parsed.time_compacting ?? undefined,
+        archived: parsed.time_archived ?? undefined,
       },
     }
   }
@@ -99,9 +105,9 @@ export namespace Session {
       summary_additions: info.summary?.additions,
       summary_deletions: info.summary?.deletions,
       summary_files: info.summary?.files,
-      summary_diffs: info.summary?.diffs,
-      revert: info.revert ?? null,
-      permission: info.permission,
+      summary_diffs: info.summary?.diffs ? JSON.stringify(info.summary.diffs) : null,
+      revert: info.revert ? JSON.stringify(info.revert) : null,
+      permission: info.permission ? JSON.stringify(info.permission) : null,
       time_created: info.time.created,
       time_updated: info.time.updated,
       time_compacting: info.time.compacting,
@@ -283,11 +289,8 @@ export namespace Session {
     const now = Date.now()
     Database.use((db) => {
       const row = db
-        .update(SessionTable)
-        .set({ time_updated: now })
-        .where(eq(SessionTable.id, sessionID))
-        .returning()
-        .get()
+        .query<SessionRow, [number, string]>("UPDATE session SET time_updated = ? WHERE id = ? RETURNING *")
+        .get(now, sessionID)
       if (!row) throw new NotFoundError({ message: `Session not found: ${sessionID}` })
       const info = fromRow(row)
       Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -318,8 +321,31 @@ export namespace Session {
       },
     }
     log.info("created", result)
+    const row = toRow(result)
     Database.use((db) => {
-      db.insert(SessionTable).values(toRow(result)).run()
+      db.query(
+        `INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.project_id,
+        row.workspace_id ?? null,
+        row.parent_id ?? null,
+        row.slug,
+        row.directory,
+        row.title,
+        row.version,
+        row.share_url ?? null,
+        row.summary_additions ?? null,
+        row.summary_deletions ?? null,
+        row.summary_files ?? null,
+        row.summary_diffs ?? null,
+        row.revert ?? null,
+        row.permission ?? null,
+        row.time_created,
+        row.time_updated,
+        row.time_compacting ?? null,
+        row.time_archived ?? null,
+      )
       Database.effect(() =>
         Bus.publish(Event.Created, {
           info: result,
@@ -345,7 +371,7 @@ export namespace Session {
   }
 
   export const get = fn(SessionID.zod, async (id) => {
-    const row = Database.use((db) => db.select().from(SessionTable).where(eq(SessionTable.id, id)).get())
+    const row = Database.use((db) => db.query<SessionRow, [string]>("SELECT * FROM session WHERE id = ?").get(id))
     if (!row) throw new NotFoundError({ message: `Session not found: ${id}` })
     return fromRow(row)
   })
@@ -358,7 +384,13 @@ export namespace Session {
     const { ShareNext } = await import("@/share/share-next")
     const share = await ShareNext.create(id)
     Database.use((db) => {
-      const row = db.update(SessionTable).set({ share_url: share.url }).where(eq(SessionTable.id, id)).returning().get()
+      const now = Date.now()
+      const row = db
+        .query<
+          SessionRow,
+          [string, number, string]
+        >("UPDATE session SET share_url = ?, time_updated = ? WHERE id = ? RETURNING *")
+        .get(share.url, now, id)
       if (!row) throw new NotFoundError({ message: `Session not found: ${id}` })
       const info = fromRow(row)
       Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -371,7 +403,13 @@ export namespace Session {
     const { ShareNext } = await import("@/share/share-next")
     await ShareNext.remove(id)
     Database.use((db) => {
-      const row = db.update(SessionTable).set({ share_url: null }).where(eq(SessionTable.id, id)).returning().get()
+      const now = Date.now()
+      const row = db
+        .query<
+          SessionRow,
+          [null, number, string]
+        >("UPDATE session SET share_url = ?, time_updated = ? WHERE id = ? RETURNING *")
+        .get(null, now, id)
       if (!row) throw new NotFoundError({ message: `Session not found: ${id}` })
       const info = fromRow(row)
       Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -385,12 +423,13 @@ export namespace Session {
     }),
     async (input) => {
       return Database.use((db) => {
+        const now = Date.now()
         const row = db
-          .update(SessionTable)
-          .set({ title: input.title })
-          .where(eq(SessionTable.id, input.sessionID))
-          .returning()
-          .get()
+          .query<
+            SessionRow,
+            [string, number, string]
+          >("UPDATE session SET title = ?, time_updated = ? WHERE id = ? RETURNING *")
+          .get(input.title, now, input.sessionID)
         if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
         const info = fromRow(row)
         Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -406,12 +445,13 @@ export namespace Session {
     }),
     async (input) => {
       return Database.use((db) => {
+        const now = Date.now()
         const row = db
-          .update(SessionTable)
-          .set({ time_archived: input.time })
-          .where(eq(SessionTable.id, input.sessionID))
-          .returning()
-          .get()
+          .query<
+            SessionRow,
+            [number | null, number, string]
+          >("UPDATE session SET time_archived = ?, time_updated = ? WHERE id = ? RETURNING *")
+          .get(input.time ?? null, now, input.sessionID)
         if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
         const info = fromRow(row)
         Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -427,12 +467,13 @@ export namespace Session {
     }),
     async (input) => {
       return Database.use((db) => {
+        const now = Date.now()
         const row = db
-          .update(SessionTable)
-          .set({ permission: input.permission, time_updated: Date.now() })
-          .where(eq(SessionTable.id, input.sessionID))
-          .returning()
-          .get()
+          .query<
+            SessionRow,
+            [string, number, string]
+          >("UPDATE session SET permission = ?, time_updated = ? WHERE id = ? RETURNING *")
+          .get(JSON.stringify(input.permission), now, input.sessionID)
         if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
         const info = fromRow(row)
         Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -449,18 +490,20 @@ export namespace Session {
     }),
     async (input) => {
       return Database.use((db) => {
+        const now = Date.now()
         const row = db
-          .update(SessionTable)
-          .set({
-            revert: input.revert ?? null,
-            summary_additions: input.summary?.additions,
-            summary_deletions: input.summary?.deletions,
-            summary_files: input.summary?.files,
-            time_updated: Date.now(),
-          })
-          .where(eq(SessionTable.id, input.sessionID))
-          .returning()
-          .get()
+          .query<
+            SessionRow,
+            [string | null, number | null, number | null, number | null, number, string]
+          >("UPDATE session SET revert = ?, summary_additions = ?, summary_deletions = ?, summary_files = ?, time_updated = ? WHERE id = ? RETURNING *")
+          .get(
+            input.revert ? JSON.stringify(input.revert) : null,
+            input.summary?.additions ?? null,
+            input.summary?.deletions ?? null,
+            input.summary?.files ?? null,
+            now,
+            input.sessionID,
+          )
         if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
         const info = fromRow(row)
         Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -471,15 +514,13 @@ export namespace Session {
 
   export const clearRevert = fn(SessionID.zod, async (sessionID) => {
     return Database.use((db) => {
+      const now = Date.now()
       const row = db
-        .update(SessionTable)
-        .set({
-          revert: null,
-          time_updated: Date.now(),
-        })
-        .where(eq(SessionTable.id, sessionID))
-        .returning()
-        .get()
+        .query<
+          SessionRow,
+          [null, number, string]
+        >("UPDATE session SET revert = ?, time_updated = ? WHERE id = ? RETURNING *")
+        .get(null, now, sessionID)
       if (!row) throw new NotFoundError({ message: `Session not found: ${sessionID}` })
       const info = fromRow(row)
       Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -494,17 +535,19 @@ export namespace Session {
     }),
     async (input) => {
       return Database.use((db) => {
+        const now = Date.now()
         const row = db
-          .update(SessionTable)
-          .set({
-            summary_additions: input.summary?.additions,
-            summary_deletions: input.summary?.deletions,
-            summary_files: input.summary?.files,
-            time_updated: Date.now(),
-          })
-          .where(eq(SessionTable.id, input.sessionID))
-          .returning()
-          .get()
+          .query<
+            SessionRow,
+            [number | null, number | null, number | null, number, string]
+          >("UPDATE session SET summary_additions = ?, summary_deletions = ?, summary_files = ?, time_updated = ? WHERE id = ? RETURNING *")
+          .get(
+            input.summary?.additions ?? null,
+            input.summary?.deletions ?? null,
+            input.summary?.files ?? null,
+            now,
+            input.sessionID,
+          )
         if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
         const info = fromRow(row)
         Database.effect(() => Bus.publish(Event.Updated, { info }))
@@ -515,7 +558,7 @@ export namespace Session {
 
   export const diff = fn(SessionID.zod, async (sessionID) => {
     try {
-      return await Storage.read<Snapshot.FileDiff[]>(["session_diff", sessionID])
+      return SessionDiff.read(sessionID)
     } catch {
       return []
     }
@@ -546,34 +589,38 @@ export namespace Session {
     limit?: number
   }) {
     const project = Instance.project
-    const conditions = [eq(SessionTable.project_id, project.id)]
+    const where: string[] = ["project_id = ?"]
+    const params: any[] = [project.id]
 
     if (WorkspaceContext.workspaceID) {
-      conditions.push(eq(SessionTable.workspace_id, WorkspaceContext.workspaceID))
+      where.push("workspace_id = ?")
+      params.push(WorkspaceContext.workspaceID)
     }
     if (input?.directory) {
-      conditions.push(eq(SessionTable.directory, input.directory))
+      where.push("directory = ?")
+      params.push(input.directory)
     }
     if (input?.roots) {
-      conditions.push(isNull(SessionTable.parent_id))
+      where.push("parent_id IS NULL")
     }
     if (input?.start) {
-      conditions.push(gte(SessionTable.time_updated, input.start))
+      where.push("time_updated >= ?")
+      params.push(input.start)
     }
     if (input?.search) {
-      conditions.push(like(SessionTable.title, `%${input.search}%`))
+      where.push("title LIKE ?")
+      params.push(`%${input.search}%`)
     }
 
     const limit = input?.limit ?? 100
 
     const rows = Database.use((db) =>
       db
-        .select()
-        .from(SessionTable)
-        .where(and(...conditions))
-        .orderBy(desc(SessionTable.time_updated))
-        .limit(limit)
-        .all(),
+        .query<
+          SessionRow,
+          any[]
+        >(`SELECT * FROM session WHERE ${where.join(" AND ")} ORDER BY time_updated DESC LIMIT ?`)
+        .all(...params, limit),
     )
     for (const row of rows) {
       yield fromRow(row)
@@ -589,50 +636,53 @@ export namespace Session {
     limit?: number
     archived?: boolean
   }) {
-    const conditions: SQL[] = []
+    const where: string[] = []
+    const params: any[] = []
 
     if (input?.directory) {
-      conditions.push(eq(SessionTable.directory, input.directory))
+      where.push("directory = ?")
+      params.push(input.directory)
     }
     if (input?.roots) {
-      conditions.push(isNull(SessionTable.parent_id))
+      where.push("parent_id IS NULL")
     }
     if (input?.start) {
-      conditions.push(gte(SessionTable.time_updated, input.start))
+      where.push("time_updated >= ?")
+      params.push(input.start)
     }
     if (input?.cursor) {
-      conditions.push(lt(SessionTable.time_updated, input.cursor))
+      where.push("time_updated < ?")
+      params.push(input.cursor)
     }
     if (input?.search) {
-      conditions.push(like(SessionTable.title, `%${input.search}%`))
+      where.push("title LIKE ?")
+      params.push(`%${input.search}%`)
     }
     if (!input?.archived) {
-      conditions.push(isNull(SessionTable.time_archived))
+      where.push("time_archived IS NULL")
     }
 
     const limit = input?.limit ?? 100
 
     const rows = Database.use((db) => {
-      const query =
-        conditions.length > 0
-          ? db
-              .select()
-              .from(SessionTable)
-              .where(and(...conditions))
-          : db.select().from(SessionTable)
-      return query.orderBy(desc(SessionTable.time_updated), desc(SessionTable.id)).limit(limit).all()
+      const clause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""
+      return db
+        .query<SessionRow, any[]>(`SELECT * FROM session ${clause} ORDER BY time_updated DESC, id DESC LIMIT ?`)
+        .all(...params, limit)
     })
 
     const ids = [...new Set(rows.map((row) => row.project_id))]
     const projects = new Map<string, ProjectInfo>()
 
     if (ids.length > 0) {
+      const placeholders = ids.map(() => "?").join(", ")
       const items = Database.use((db) =>
         db
-          .select({ id: ProjectTable.id, name: ProjectTable.name, worktree: ProjectTable.worktree })
-          .from(ProjectTable)
-          .where(inArray(ProjectTable.id, ids))
-          .all(),
+          .query<
+            { id: string; name: string | null; worktree: string },
+            any[]
+          >(`SELECT id, name, worktree FROM project WHERE id IN (${placeholders})`)
+          .all(...ids),
       )
       for (const item of items) {
         projects.set(item.id, {
@@ -653,10 +703,8 @@ export namespace Session {
     const project = Instance.project
     const rows = Database.use((db) =>
       db
-        .select()
-        .from(SessionTable)
-        .where(and(eq(SessionTable.project_id, project.id), eq(SessionTable.parent_id, parentID)))
-        .all(),
+        .query<SessionRow, [string, string]>("SELECT * FROM session WHERE project_id = ? AND parent_id = ?")
+        .all(project.id, parentID),
     )
     return rows.map(fromRow)
   })
@@ -671,7 +719,7 @@ export namespace Session {
       await unshare(sessionID).catch(() => {})
       // CASCADE delete handles messages and parts automatically
       Database.use((db) => {
-        db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run()
+        db.query("DELETE FROM session WHERE id = ?").run(sessionID)
         Database.effect(() =>
           Bus.publish(Event.Deleted, {
             info: session,
@@ -684,18 +732,14 @@ export namespace Session {
   })
 
   export const updateMessage = fn(MessageV2.Info, async (msg) => {
-    const time_created = msg.time.created
+    const time = msg.time.created
     const { id, sessionID, ...data } = msg
+    const json = JSON.stringify(data)
+    const now = Date.now()
     Database.use((db) => {
-      db.insert(MessageTable)
-        .values({
-          id,
-          session_id: sessionID,
-          time_created,
-          data,
-        })
-        .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
-        .run()
+      db.query(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = ?, time_updated = ?",
+      ).run(id, sessionID, time, now, json, json, now)
       Database.effect(() =>
         Bus.publish(MessageV2.Event.Updated, {
           info: msg,
@@ -713,9 +757,7 @@ export namespace Session {
     async (input) => {
       // CASCADE delete handles parts automatically
       Database.use((db) => {
-        db.delete(MessageTable)
-          .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
-          .run()
+        db.query("DELETE FROM message WHERE id = ? AND session_id = ?").run(input.messageID, input.sessionID)
         Database.effect(() =>
           Bus.publish(MessageV2.Event.Removed, {
             sessionID: input.sessionID,
@@ -735,9 +777,7 @@ export namespace Session {
     }),
     async (input) => {
       Database.use((db) => {
-        db.delete(PartTable)
-          .where(and(eq(PartTable.id, input.partID), eq(PartTable.session_id, input.sessionID)))
-          .run()
+        db.query("DELETE FROM part WHERE id = ? AND session_id = ?").run(input.partID, input.sessionID)
         Database.effect(() =>
           Bus.publish(MessageV2.Event.PartRemoved, {
             sessionID: input.sessionID,
@@ -754,18 +794,12 @@ export namespace Session {
 
   export const updatePart = fn(UpdatePartInput, async (part) => {
     const { id, messageID, sessionID, ...data } = part
-    const time = Date.now()
+    const now = Date.now()
+    const json = JSON.stringify(data)
     Database.use((db) => {
-      db.insert(PartTable)
-        .values({
-          id,
-          message_id: messageID,
-          session_id: sessionID,
-          time_created: time,
-          data,
-        })
-        .onConflictDoUpdate({ target: PartTable.id, set: { data } })
-        .run()
+      db.query(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = ?, time_updated = ?",
+      ).run(id, messageID, sessionID, now, now, json, json, now)
       Database.effect(() =>
         Bus.publish(MessageV2.Event.PartUpdated, {
           part: structuredClone(part),

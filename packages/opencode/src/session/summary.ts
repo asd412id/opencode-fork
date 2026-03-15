@@ -7,8 +7,9 @@ import { Identifier } from "@/id/id"
 import { SessionID, MessageID } from "./schema"
 import { Snapshot } from "@/snapshot"
 
-import { Storage } from "@/storage/storage"
+import { SessionDiff } from "./session-diff.sql"
 import { Bus } from "@/bus"
+import { GC } from "@/util/gc"
 
 export namespace SessionSummary {
   function unquoteGitPath(input: string) {
@@ -78,6 +79,7 @@ export namespace SessionSummary {
         summarizeSession({ sessionID: input.sessionID, messages: all }),
         summarizeMessage({ messageID: input.messageID, messages: all }),
       ])
+      GC.hint()
     },
   )
 
@@ -91,7 +93,7 @@ export namespace SessionSummary {
         files: diffs.length,
       },
     })
-    await Storage.write(["session_diff", input.sessionID], diffs)
+    await writeDiff(input.sessionID, diffs)
     Bus.publish(Session.Event.Diff, {
       sessionID: input.sessionID,
       diff: diffs,
@@ -118,7 +120,7 @@ export namespace SessionSummary {
       messageID: MessageID.zod.optional(),
     }),
     async (input) => {
-      const diffs = await Storage.read<Snapshot.FileDiff[]>(["session_diff", input.sessionID]).catch(() => [])
+      const diffs = readDiff(input.sessionID)
       const next = diffs.map((item) => {
         const file = unquoteGitPath(item.file)
         if (file === item.file) return item
@@ -128,7 +130,7 @@ export namespace SessionSummary {
         }
       })
       const changed = next.some((item, i) => item.file !== diffs[i]?.file)
-      if (changed) Storage.write(["session_diff", input.sessionID], next).catch(() => {})
+      if (changed) writeDiff(input.sessionID, next).catch(() => {})
       return next
     },
   )
@@ -158,5 +160,13 @@ export namespace SessionSummary {
 
     if (from && to) return Snapshot.diffFull(from, to)
     return []
+  }
+
+  function readDiff(id: SessionID): Snapshot.FileDiff[] {
+    return SessionDiff.read(id)
+  }
+
+  async function writeDiff(id: SessionID, data: Snapshot.FileDiff[]) {
+    SessionDiff.write(id, data)
   }
 }

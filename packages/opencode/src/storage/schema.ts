@@ -1,5 +1,6 @@
-export { AccountTable, AccountStateTable, ControlAccountTable } from "../account/account.sql"
-export { ProjectTable } from "../project/project.sql"
-export { SessionTable, MessageTable, PartTable, TodoTable, PermissionTable } from "../session/session.sql"
-export { SessionShareTable } from "../share/share.sql"
-export { WorkspaceTable } from "../control-plane/workspace.sql"
+// Schema barrel — type-only row definitions
+export type { AccountRow, AccountStateRow, ControlAccountRow } from "../account/account.sql"
+export type { ProjectRow } from "../project/project.sql"
+export type { SessionRow, MessageRow, PartRow, TodoRow, PermissionRow } from "../session/session.sql"
+export type { SessionShareRow } from "../share/share.sql"
+export type { WorkspaceRow } from "../control-plane/workspace.sql"

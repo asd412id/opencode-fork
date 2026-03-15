@@ -4,9 +4,8 @@ import { Snapshot } from "../snapshot"
 import { MessageV2 } from "./message-v2"
 import { Session } from "."
 import { Log } from "../util/log"
-import { Database, eq } from "../storage/db"
-import { MessageTable, PartTable } from "./session.sql"
-import { Storage } from "@/storage/storage"
+import { Database } from "../storage/db"
+import { SessionDiff } from "./session-diff.sql"
 import { Bus } from "../bus"
 import { SessionPrompt } from "./prompt"
 import { SessionSummary } from "./summary"
@@ -61,7 +60,7 @@ export namespace SessionRevert {
       if (revert.snapshot) revert.diff = await Snapshot.diff(revert.snapshot)
       const rangeMessages = all.filter((msg) => msg.info.id >= revert!.messageID)
       const diffs = await SessionSummary.computeDiff({ messages: rangeMessages })
-      await Storage.write(["session_diff", input.sessionID], diffs)
+      SessionDiff.write(input.sessionID, diffs)
       Bus.publish(Session.Event.Diff, {
         sessionID: input.sessionID,
         diff: diffs,
@@ -113,7 +112,7 @@ export namespace SessionRevert {
       remove.push(msg)
     }
     for (const msg of remove) {
-      Database.use((db) => db.delete(MessageTable).where(eq(MessageTable.id, msg.info.id)).run())
+      Database.use((db) => db.query("DELETE FROM message WHERE id = ?").run(msg.info.id))
       await Bus.publish(MessageV2.Event.Removed, { sessionID: sessionID, messageID: msg.info.id })
     }
     if (session.revert.partID && target) {
@@ -124,7 +123,7 @@ export namespace SessionRevert {
         const removeParts = target.parts.slice(removeStart)
         target.parts = preserveParts
         for (const part of removeParts) {
-          Database.use((db) => db.delete(PartTable).where(eq(PartTable.id, part.id)).run())
+          Database.use((db) => db.query("DELETE FROM part WHERE id = ?").run(part.id))
           await Bus.publish(MessageV2.Event.PartRemoved, {
             sessionID: sessionID,
             messageID: target.info.id,

@@ -13,6 +13,7 @@ import { Provider } from "../provider/provider"
 import { ModelID, ProviderID } from "../provider/schema"
 import { type Tool as AITool, tool, jsonSchema, type ToolCallOptions, asSchema } from "ai"
 import { SessionCompaction } from "./compaction"
+import { GC } from "../util/gc"
 import { Instance } from "../project/instance"
 import { Bus } from "../bus"
 import { ProviderTransform } from "../provider/transform"
@@ -27,6 +28,7 @@ import { ToolRegistry } from "../tool/registry"
 import { MCP } from "../mcp"
 import { LSP } from "../lsp"
 import { ReadTool } from "../tool/read"
+import { MemoryContext } from "../memory/context-loader"
 import { FileTime } from "../file/time"
 import { Flag } from "../flag/flag"
 import { ulid } from "ulid"
@@ -298,7 +300,7 @@ export namespace SessionPrompt {
       SessionStatus.set(sessionID, { type: "busy" })
       log.info("loop", { step, sessionID })
       if (abort.aborted) break
-      let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+      let msgs = await MessageV2.since(sessionID)
 
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
@@ -328,13 +330,25 @@ export namespace SessionPrompt {
       }
 
       step++
-      if (step === 1)
+      if (step === 1) {
         ensureTitle({
           session,
           modelID: lastUser.model.modelID,
           providerID: lastUser.model.providerID,
           history: msgs,
         })
+        const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+        if (lastUserMsg) {
+          const userText = lastUserMsg.parts
+            .filter((p) => p.type === "text")
+            .map((p) => (p as MessageV2.TextPart).text)
+            .join(" ")
+          await MemoryContext.injectRelevantAsContext({
+            sessionID,
+            userMessage: userText,
+          })
+        }
+      }
 
       const model = await Provider.getModel(lastUser.model.providerID, lastUser.model.modelID).catch((e) => {
         if (Provider.ModelNotFoundError.isInstance(e)) {
@@ -653,9 +667,13 @@ export namespace SessionPrompt {
 
       // Build system prompt, adding structured output instruction if needed
       const skills = await SystemPrompt.skills(agent)
+      const memoryGuideline = SystemPrompt.memory()
+      const recentMemory = await SystemPrompt.recentMemory()
       const system = [
         ...(await SystemPrompt.environment(model)),
         ...(skills ? [skills] : []),
+        memoryGuideline,
+        ...(recentMemory ? [recentMemory] : []),
         ...(await InstructionPrompt.system()),
       ]
       const format = lastUser.format ?? { type: "text" }
@@ -721,6 +739,7 @@ export namespace SessionPrompt {
       }
       continue
     }
+    GC.hint()
     SessionCompaction.prune({ sessionID })
     for await (const item of MessageV2.stream(sessionID)) {
       if (item.info.role === "user") continue

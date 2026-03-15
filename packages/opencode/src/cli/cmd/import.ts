@@ -5,7 +5,7 @@ import { MessageV2 } from "../../session/message-v2"
 import { cmd } from "./cmd"
 import { bootstrap } from "../bootstrap"
 import { Database } from "../../storage/db"
-import { SessionTable, MessageTable, PartTable } from "../../session/session.sql"
+import type { SessionRow } from "../../session/session.sql"
 import { Instance } from "../../project/instance"
 import { ShareNext } from "../../share/share-next"
 import { EOL } from "os"
@@ -158,12 +158,34 @@ export const ImportCommand = cmd({
         projectID: Instance.project.id,
       })
       const row = Session.toRow(info)
+      const now = Date.now()
       Database.use((db) =>
         db
-          .insert(SessionTable)
-          .values(row)
-          .onConflictDoUpdate({ target: SessionTable.id, set: { project_id: row.project_id } })
-          .run(),
+          .query(
+            `INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET project_id = ?`,
+          )
+          .run(
+            row.id,
+            row.project_id,
+            (row as any).workspace_id ?? null,
+            row.parent_id ?? null,
+            row.slug,
+            row.directory,
+            row.title,
+            row.version,
+            row.share_url ?? null,
+            row.summary_additions ?? null,
+            row.summary_deletions ?? null,
+            row.summary_files ?? null,
+            row.summary_diffs ? JSON.stringify(row.summary_diffs) : null,
+            row.revert ? JSON.stringify(row.revert) : null,
+            row.permission ? JSON.stringify(row.permission) : null,
+            row.time_created,
+            row.time_updated,
+            row.time_compacting ?? null,
+            row.time_archived ?? null,
+            row.project_id,
+          ),
       )
 
       for (const msg of exportData.messages) {
@@ -171,15 +193,10 @@ export const ImportCommand = cmd({
         const { id, sessionID: _, ...msgData } = msgInfo
         Database.use((db) =>
           db
-            .insert(MessageTable)
-            .values({
-              id,
-              session_id: row.id,
-              time_created: msgInfo.time?.created ?? Date.now(),
-              data: msgData,
-            })
-            .onConflictDoNothing()
-            .run(),
+            .query(
+              "INSERT OR IGNORE INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+            )
+            .run(id, row.id, msgInfo.time?.created ?? now, msgInfo.time?.created ?? now, JSON.stringify(msgData)),
         )
 
         for (const part of msg.parts) {
@@ -187,15 +204,10 @@ export const ImportCommand = cmd({
           const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
           Database.use((db) =>
             db
-              .insert(PartTable)
-              .values({
-                id: partId,
-                message_id: messageID,
-                session_id: row.id,
-                data: partData,
-              })
-              .onConflictDoNothing()
-              .run(),
+              .query(
+                "INSERT OR IGNORE INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+              )
+              .run(partId, messageID, row.id, now, now, JSON.stringify(partData)),
           )
         }
       }
