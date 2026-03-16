@@ -2,15 +2,25 @@
 
 import { Script } from "@opencode-ai/script"
 import { $ } from "bun"
+import { buildNotes, getLatestRelease } from "./changelog.ts"
 
 const output = [`version=${Script.version}`]
 
 if (!Script.preview) {
-  // Simple commit-list changelog (no AI summarization)
-  const body = await $`git log --oneline -50`.text().then((x) => x.trim())
+  let body = ""
+  try {
+    const prev = await getLatestRelease(Script.version)
+    const notes = await buildNotes(prev, "HEAD")
+    body = notes.join("\n")
+  } catch (e) {
+    console.log("Failed to generate changelog, falling back to commit list:", e)
+    body = await $`git log --oneline -50`.text().then((x) => x.trim())
+  }
+  if (!body) body = "No notable changes"
+
   const dir = process.env.RUNNER_TEMP ?? "/tmp"
   const file = `${dir}/opencode-release-notes.txt`
-  await Bun.write(file, body || "No notable changes")
+  await Bun.write(file, body)
   await $`gh release create v${Script.version} -d --title "v${Script.version}" --notes-file ${file}`
   const release = await $`gh release view v${Script.version} --json tagName,databaseId`.json()
   output.push(`release=${release.databaseId}`)
