@@ -27,5 +27,9 @@ function transformExports(exports: Record<string, string | object>) {
 transformExports(pkg.exports)
 await Bun.write("package.json", JSON.stringify(pkg, null, 2))
 await $`bun pm pack`
-await $`npm publish *.tgz --tag ${Script.channel} --access public`
+if (process.env.NPM_TOKEN) {
+  await $`npm publish *.tgz --tag ${Script.channel} --access public`
+} else {
+  console.log("Skipping npm publish (no NPM_TOKEN)")
+}
 await Bun.write("package.json", JSON.stringify(original, null, 2))
