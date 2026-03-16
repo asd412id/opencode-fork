@@ -209,16 +209,30 @@ jobs:
         id: signing
         shell: bash
         run: |
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
+          if [ -n "$SIGNING_KEY" ]; then
             echo "updater=true" >> "$GITHUB_OUTPUT"
           else
             echo "updater=false" >> "$GITHUB_OUTPUT"
           fi
-          if [ -n "${{ secrets.APPLE_CERTIFICATE }}" ]; then
-            echo "apple=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "apple=false" >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+      - name: Disable updater for unsigned builds
+        if: steps.signing.outputs.updater != 'true'
+        shell: bash
+        run: |
+          cd packages/desktop/src-tauri
+          # Remove updater config and createUpdaterArtifacts to allow building without signing key
+          node -e "
+            const f = 'tauri.prod.conf.json';
+            const c = JSON.parse(require('fs').readFileSync(f, 'utf8'));
+            delete c.bundle.createUpdaterArtifacts;
+            delete c.plugins?.updater;
+            if (c.plugins && Object.keys(c.plugins).length === 0) delete c.plugins;
+            require('fs').writeFileSync(f, JSON.stringify(c, null, 2));
+          "
+          echo "Disabled updater config for unsigned build"
+          cat tauri.prod.conf.json
 
       - name: Build and upload artifacts (with signing)
         if: steps.signing.outputs.updater == 'true'
@@ -267,6 +281,7 @@ jobs:
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
 
   publish:
+    if: always() && needs.version.result == 'success' && needs.build-cli.result == 'success'
     needs:
       - version
       - build-cli
