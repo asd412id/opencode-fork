@@ -39,7 +39,12 @@ if (Script.release) {
     await new Promise((resolve) => setTimeout(resolve, 5_000))
   }
 
-  await import(`../packages/desktop/scripts/finalize-latest-json.ts`)
+  // Only finalize latest.json if TAURI_SIGNING_PRIVATE_KEY was set (updater artifacts exist)
+  if (process.env.TAURI_SIGNING_PRIVATE_KEY) {
+    await import(`../packages/desktop/scripts/finalize-latest-json.ts`)
+  } else {
+    console.log("Skipping finalize-latest-json (no signing key, updater artifacts not generated)")
+  }
 
   await $`gh release edit v${Script.version} --draft=false --repo ${process.env.GH_REPO}`
 }
