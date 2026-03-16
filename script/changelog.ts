@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
-import { createOpencode } from "@opencode-ai/sdk/v2"
 import { parseArgs } from "util"
 import { Script } from "@opencode-ai/script"
 
@@ -11,8 +10,13 @@ type Release = {
   prerelease: boolean
 }
 
+const repo = process.env.GH_REPO ?? process.env.GITHUB_REPOSITORY ?? ""
+
 export async function getLatestRelease(skip?: string) {
-  const data = await fetch("https://api.github.com/repos/anomalyco/opencode/releases?per_page=100").then((res) => {
+  const url = repo
+    ? `https://api.github.com/repos/${repo}/releases?per_page=100`
+    : "https://api.github.com/repos/anomalyco/opencode/releases?per_page=100"
+  const data = await fetch(url).then((res) => {
     if (!res.ok) throw new Error(res.statusText)
     return res.json()
   })
@@ -41,9 +45,11 @@ export async function getCommits(from: string, to: string): Promise<Commit[]> {
   const fromRef = from.startsWith("v") ? from : `v${from}`
   const toRef = to === "HEAD" ? to : to.startsWith("v") ? to : `v${to}`
 
+  const target = repo || "anomalyco/opencode"
+
   // Get commit data with GitHub usernames from the API
   const compare =
-    await $`gh api "/repos/anomalyco/opencode/compare/${fromRef}...${toRef}" --jq '.commits[] | {sha: .sha, login: .author.login, message: .commit.message}'`.text()
+    await $`gh api "/repos/${target}/compare/${fromRef}...${toRef}" --jq '.commits[] | {sha: .sha, login: .author.login, message: .commit.message}'`.text()
 
   const commitData = new Map<string, { login: string | null; message: string }>()
   for (const line of compare.split("\n").filter(Boolean)) {
@@ -136,72 +142,47 @@ function getSection(areas: Set<string>): string {
   return "Core"
 }
 
-async function summarizeCommit(opencode: Awaited<ReturnType<typeof createOpencode>>, message: string): Promise<string> {
-  console.log("summarizing commit:", message)
-  const session = await opencode.client.session.create()
-  const result = await opencode.client.session
-    .prompt(
-      {
-        sessionID: session.data!.id,
-        model: { providerID: "opencode", modelID: "claude-sonnet-4-5" },
-        tools: {
-          "*": false,
-        },
-        parts: [
-          {
-            type: "text",
-            text: `Summarize this commit message for a changelog entry. Return ONLY a single line summary starting with a capital letter. Be concise but specific. If the commit message is already well-written, just clean it up (capitalize, fix typos, proper grammar). Do not include any prefixes like "fix:" or "feat:".
+export async function buildNotes(from: string, to: string) {
+  const commits = await getCommits(from, to)
 
-Commit: ${message}`,
-          },
-        ],
-      },
-      {
-        signal: AbortSignal.timeout(120_000),
-      },
-    )
-    .then((x) => x.data?.parts?.find((y) => y.type === "text")?.text ?? message)
-  return result.trim()
-}
-
-export async function generateChangelog(commits: Commit[], opencode: Awaited<ReturnType<typeof createOpencode>>) {
-  // Summarize commits in parallel with max 10 concurrent requests
-  const BATCH_SIZE = 10
-  const summaries: string[] = []
-  for (let i = 0; i < commits.length; i += BATCH_SIZE) {
-    const batch = commits.slice(i, i + BATCH_SIZE)
-    const results = await Promise.all(batch.map((c) => summarizeCommit(opencode, c.message)))
-    summaries.push(...results)
+  if (commits.length === 0) {
+    return []
   }
 
+  console.log("generating changelog since " + from)
+
+  const notes: string[] = []
+
+  // Simple commit list (no AI summarization)
   const grouped = new Map<string, string[]>()
-  for (let i = 0; i < commits.length; i++) {
-    const commit = commits[i]!
+  for (const commit of commits) {
     const section = getSection(commit.areas)
     const attribution = commit.author && !Script.team.includes(commit.author) ? ` (@${commit.author})` : ""
-    const entry = `- ${summaries[i]}${attribution}`
+    const entry = `- ${commit.message}${attribution}`
 
     if (!grouped.has(section)) grouped.set(section, [])
     grouped.get(section)!.push(entry)
   }
 
-  const sectionOrder = ["Core", "TUI", "Desktop", "SDK", "Extensions"]
-  const lines: string[] = []
-  for (const section of sectionOrder) {
+  const order = ["Core", "TUI", "Desktop", "SDK", "Extensions"]
+  for (const section of order) {
     const entries = grouped.get(section)
     if (!entries || entries.length === 0) continue
-    lines.push(`## ${section}`)
-    lines.push(...entries)
+    notes.push(`## ${section}`)
+    notes.push(...entries)
   }
 
-  return lines
-}
+  console.log("---- Generated Changelog ----")
+  console.log(notes.join("\n"))
+  console.log("-----------------------------")
 
-export async function getContributors(from: string, to: string) {
+  console.log("changelog generation complete")
+
+  const target = repo || "anomalyco/opencode"
   const fromRef = from.startsWith("v") ? from : `v${from}`
   const toRef = to === "HEAD" ? to : to.startsWith("v") ? to : `v${to}`
   const compare =
-    await $`gh api "/repos/anomalyco/opencode/compare/${fromRef}...${toRef}" --jq '.commits[] | {login: .author.login, message: .commit.message}'`.text()
+    await $`gh api "/repos/${target}/compare/${fromRef}...${toRef}" --jq '.commits[] | {login: .author.login, message: .commit.message}'`.text()
   const contributors = new Map<string, Set<string>>()
 
   for (const line of compare.split("\n").filter(Boolean)) {
@@ -214,44 +195,6 @@ export async function getContributors(from: string, to: string) {
       contributors.get(login)!.add(title)
     }
   }
-
-  return contributors
-}
-
-export async function buildNotes(from: string, to: string) {
-  const commits = await getCommits(from, to)
-
-  if (commits.length === 0) {
-    return []
-  }
-
-  console.log("generating changelog since " + from)
-
-  const opencode = await createOpencode({ port: 0 })
-  const notes: string[] = []
-
-  try {
-    const lines = await generateChangelog(commits, opencode)
-    notes.push(...lines)
-    console.log("---- Generated Changelog ----")
-    console.log(notes.join("\n"))
-    console.log("-----------------------------")
-  } catch (error) {
-    if (error instanceof Error && error.name === "TimeoutError") {
-      console.log("Changelog generation timed out, using raw commits")
-      for (const commit of commits) {
-        const attribution = commit.author && !team.includes(commit.author) ? ` (@${commit.author})` : ""
-        notes.push(`- ${commit.message}${attribution}`)
-      }
-    } else {
-      throw error
-    }
-  } finally {
-    await opencode.server.close()
-  }
-  console.log("changelog generation complete")
-
-  const contributors = await getContributors(from, to)
 
   if (contributors.size > 0) {
     notes.push("")
